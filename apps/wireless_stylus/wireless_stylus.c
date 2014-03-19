@@ -2,9 +2,8 @@
 
 Wireless stylus app with two buttons.
 Uses PM3 low power mode to sleep until it recieves an interrupt from a button press.
-Then it goes back to sleep until the button is released.
 
-Based on the test_radio_sleep app to shut down the radio when sleeping to save more power.
+NOTE: this program is currently set to only report one button press at a time. It will not work if both buttons are pressed together.
 
 == Pinout ==
 
@@ -22,39 +21,112 @@ param_radio_channel = channel number for radio transmissions. The receiver must 
 
 #include <wixel.h>
 #include <stdio.h>
-#include <sleep.h>
+#include <usb.h>
+#include <usb_com.h>
 #include <usb_hid_constants.h>
-#include <radio_queue.h>
+#include <radio_registers.h>
 
 #define BUTTON_1 12
 #define BUTTON_2 13
 
+#define TX_INTERVAL 10 // time between transmissions (ms)
+
+int32 CODE param_radio_channel = 128;
+
+// This definition should match wireless_stylus_receiver.h
+#define RADIO_PACKET_SIZE 3
+
+static volatile XDATA uint8 packet[1 + RADIO_PACKET_SIZE];
+static volatile BIT radioDone = 0;
+
+static uint8 DATA currentBurstId = 0;
+static uint16 lastBurst = 0;
+
 /* FUNCTIONS ******************************************************************/
+
+void txInit()
+{
+    uint8 i;
+
+    radioRegistersInit();
+
+    CHANNR = param_radio_channel;
+
+    PKTLEN = RADIO_PACKET_SIZE;
+    
+    MCSM0 = 0x14;    // Auto-calibrate when going from idle to RX or TX.
+    MCSM1 = 0x00;    // Disable CCA.  After RX, go to IDLE.  After TX, go to IDLE.
+    // We leave MCSM2 at its default value.
+
+	IEN2 |= 0x01;    // Enable RF general interrupt
+    RFIM = 0xF0;     // Enable these interrupts: DONE, RXOVF, TXUNF, TIMEOUT
+
+    EA = 1;          // Enable interrupts in general
+
+    IOCFG2 = 0b011011; // put out a PA_PD signal on P1_7 (active low when the radio is in TX mode)
+
+    dmaConfig.radio.DC6 = 19; // WORDSIZE = 0, TMODE = 0, TRIG = 19
+
+    dmaConfig.radio.SRCADDRH = (unsigned int)packet >> 8;
+    dmaConfig.radio.SRCADDRL = (unsigned int)packet;
+    dmaConfig.radio.DESTADDRH = XDATA_SFR_ADDRESS(RFD) >> 8;
+    dmaConfig.radio.DESTADDRL = XDATA_SFR_ADDRESS(RFD);
+    dmaConfig.radio.LENL = 1 + RADIO_PACKET_SIZE;
+    dmaConfig.radio.VLEN_LENH = 0b00100000; // Transfer length is FirstByte+1
+    dmaConfig.radio.DC7 = 0x40; // SRCINC = 1, DESTINC = 0, IRQMASK = 0, M8 = 0, PRIORITY = 0
+    
+    for(i = 1; i < sizeof(packet); i++)
+    {
+        packet[i] = 'A' + i;
+    }
+    packet[0] = RADIO_PACKET_SIZE;
+
+    RFST = 4;  // Switch radio to Idle mode. (SIDLE mode)
+}
+
 
 void sendButtonStatus()
 {
-	uint8 XDATA * txBuf = radioQueueTxCurrentPacket();
-   if (packet != 0)
-   {
-       txBuf[0] = 1;   // must not exceed RADIO_QUEUE_PAYLOAD_SIZE
-	   txBuf[1] = (!isPinHigh(BUTTON_1) << MOUSE_BUTTON_LEFT) | (!isPinHigh(BUTTON_2) << MOUSE_BUTTON_RIGHT);
-       radioQueueTxSendPacket();
-   }
+    if (MARCSTATE == 1)
+    {
+		packet[1] = currentBurstId;
+        packet[2] = isPinHigh(BUTTON_1)? '0' :'1';//(!isPinHigh(BUTTON_1) << MOUSE_BUTTON_LEFT) | (!isPinHigh(BUTTON_2) << MOUSE_BUTTON_RIGHT); 
+        packet[3] = isPinHigh(BUTTON_2)? '0' :'1';
+
+		currentBurstId++;
+
+        RFIF &= ~(1<<4);                   // Clear IRQ_DONE
+        DMAARM |= (1<<DMA_CHANNEL_RADIO);  // Arm DMA channel
+        RFST = 3;                          // Switch radio to TX (STX mode)
+    }
 }
 
-// setting PICTL bit to 0 seems to trigger on BOTH rising and falling edges, while setting to 1 captures neither!
-// http://forum.pololu.com/viewtopic.php?f=30&t=6319&p=30238 has a solution, but I think we want to to do both so we can use the
-// same interrupt to for both pressing and releasing the buttons to wake up from low power
+// This is the radio interrupt. It is called when there is an underflow or the radio has completed sending the tx packet
+ISR(RF, 0)
+{
+    S1CON = 0; // Clear the general RFIF interrupt registers
+
+    if (RFIF & 0x10) // Check IRQ_DONE
+    {
+        radioDone = 1;
+		//clear the IRQ_DONE flag
+		RFIF &= ~0x10;
+    }
+}
+
 void setupButtonInterrupt()
 {
-    // clear port 1 interrupt status flag
+	P1DIR &= ~0x0C;     // DIRP1_[2-3] = 0 (P1_2 and P1_3 is an input)
+	PICTL |= 0x02;      // P1ICON = 1 (Falling edge interrupt on Port 1)
+
+	// clear port 1 interrupt status flag
     P1IFG = 0;     // P1IFG.P1IF[7:0] = 0
     // clear cpu interrupt flag
     IRCON2 &= ~0x08;    // IRCON2.P1IF = 0    
     // set port 1 interrupt mask
     P1IEN = 0x0C;      // P1IEN.P1_[2-3]IEN = 1
     // select rising edge interrupt on port 1
-    PICTL &= ~0x02;     // PICTL.P1ICON = 0
+    //PICTL &= ~0x02;     // PICTL.P1ICON = 0
     // enable port 1 interrupt
     IEN2 |= 0x10;       // IEN2.P1IE = 1
 }
@@ -69,90 +141,37 @@ ISR (P1INT, 0)
     SLEEP &= ~0x03;     // SLEEP.MODE = 11
     // clear port 1 interrupt mask
     P1IEN = 0;          // P1IEN.P1_[7:0]IEN = 0
-    // disable port 1 interrupt
-    IEN2 &= ~0x10;      // IEN2.P1IE = 0
+    
+	//Note, I don't think we want to do this since the radio depends on the interrupt
+	// disable port 1 interrupt
+    //IEN2 &= ~0x10;      // IEN2.P1IE = 0
 }
 
 void putToSleep()
 {
-    radioMacSleep();
-    sleepMode3();
-    radioMacResume();
-}
+	// Turn off the radio
+	/** Disarm the DMA channel. ************************************************/
+    DMAARM = 0x80 | (1<<DMA_CHANNEL_RADIO); // Abort any ongoing radio DMA transfer.
+    DMAIRQ &= ~(1<<DMA_CHANNEL_RADIO);      // Clear any pending radio DMA interrupt
 
-void handleButton1Release()
-{
-	//Button 1 has been pressed. Sleep until it is released or button 2 is pressed
-	do
-	{
-		setupButtonInterrupt();
-		putToSleep();
-                    
-		// on wake, wait and check again to debounce
-		delayMs(15);
-	} while (!isPinHigh(BUTTON_1) && isPinHigh(BUTTON_2));
+	 /** Clear the some flags from the radio ***********************************/
+    // We want to do it before restarting the radio (to avoid accidentally missing
+    // an event) but we want to do it as long as possible AFTER turning off the
+    // radio.
+    RFIF = ~0x30;  // Clear IRQ_DONE and IRQ_TIMEOUT if they are set.
 
-	sendButtonStatus();
+	// select sleep mode PM3
+    SLEEP |= 0x03;  // SLEEP.MODE = 11
+    // 3 NOPs as specified in 12.1.3
+    __asm nop __endasm;
+    __asm nop __endasm;
+    __asm nop __endasm;
+    // enter sleep mode
+    if (SLEEP & 0x03) PCON |= 0x01; // PCON.IDLE = 1
 
-	if (!isPinHigh(BUTTON_1) && !isPinHigh(BUTTON_2)) {
-		// Interrupt was caused by pushing button 2 but not releasing button 1
-		handleBothButtons();
-	}
-	else if (isPinHigh(BUTTON_1) && !isPinHigh(BUTTON_2)) {
-		// Some how the timing worked out that you released button 1, but also pushed button 2.
-		handleButton2Release();
-	}
-}
-
-void handleButton2Release()
-{
-	//Button 2 has been pressed. Sleep until it is released or button 1 is pressed
-	do
-	{
-		setupButtonInterrupt();
-		putToSleep();
-                    
-		// on wake, wait and check again to debounce
-		delayMs(15);
-	} while (isPinHigh(BUTTON_1) && !isPinHigh(BUTTON_2));
-
-	sendButtonStatus();
-
-	if (!isPinHigh(BUTTON_1) && !isPinHigh(BUTTON_2)) {
-		// Interrupt was caused by pushing button 2 but not releasing button 1
-		handleBothButtons();
-	}
-	else if (!isPinHigh(BUTTON_1) && isPinHigh(BUTTON_2)) {
-		// Some how the timing worked out that you released button 2, but also pushed button 1.
-		handleButton1Release();
-	}
-}
-
-// State when both buttons are pressed
-void handleBothButtons()
-{
-	//Both buttons are currently pressed. Sleep until 1 is released
-	do
-	{
-		setupButtonInterrupt();
-		putToSleep();
-                    
-		// on wake, wait and check again to debounce
-		delayMs(15);
-	} while (!isPinHigh(BUTTON_1) && !isPinHigh(BUTTON_2));
-
-	sendButtonStatus();
-
-	if (isPinHigh(BUTTON_1) && isPinHigh(BUTTON_2)) {
-		// somehow release both buttons simultaniously
-		return;
-	}
-	else if (isPinHigh(BUTTON_1)) {
-		handleButton2Release();
-	}
-	else if (isPinHigh(BUTTON_2)) {
-		handleButton1Release();
-	}
+	// Turn the radio back on
+	DMAARM |= (1<<DMA_CHANNEL_RADIO);  // Arm DMA channel
+    RFST = 4;                          // Switch radio to IDLE
 }
 
 void main()
@@ -181,9 +200,8 @@ void main()
         delayMs(300);
         LED_YELLOW(0);
 
-		sleepInit();
-		radioQueueInit();
-            
+		txInit();
+
         while (1)
         {
 			boardService();
@@ -194,21 +212,24 @@ void main()
                 putToSleep();
                         
                 // on wake, wait and check again to debounce
-                delayMs(15);
+                delayMs(25);
             } while (isPinHigh(BUTTON_1) && isPinHigh(BUTTON_2));
-
-			sendButtonStatus();
 			
-			if (!isPinHigh(BUTTON_1) && !isPinHigh(BUTTON_2)) {
-				handleBothButtons();
-			}
-			else if (!isPinHigh(BUTTON_1)) //button 1 pressed to wakeup from sleep
-			{
-				handleButton1Release();
-			}
-			else if (!isPinHigh(BUTTON_2)) {
-				handleButton2Release();
-			}
+			radioDone = 0;
+			sendButtonStatus(); // Send button down
+			
+			// Wait until the button is released and the radio message has been sent
+			while(!isPinHigh(BUTTON_1) || !isPinHigh(BUTTON_2) || !radioDone){}
+			//wait and check again to debounce
+			delayMs(25);
+			while(!isPinHigh(BUTTON_1) || !isPinHigh(BUTTON_2)){}
+			
+			radioDone = 0;
+			sendButtonStatus(); // send button up
+			
+			// Wait until the radio is done sending before going back to sleep
+			// Radio done is set to 1 in the RF interrupt
+			while(!radioDone) {}
 		}
 	}
 }

@@ -1,1 +1,1 @@
-APP_LIBS := dma.lib usb.lib usb_hid.lib wixel.lib radio_mac.lib radio_queue.lib radio_registers.lib random.lib
+APP_LIBS := dma.lib usb.lib usb_hid.lib wixel.lib radio_mac.lib radio_queue.lib radio_registers.lib random.lib usb_cdc_acm.lib
