@@ -16,7 +16,9 @@ computer using its USB HID interface.
 #include <ctype.h>
 
 int32 CODE param_radio_channel = 128;
-#define USE_HID 1
+
+// uncomment if you want to use the hid interface rather than a com port
+//#define USE_HID 1
 
 // This definition should be the same in both test_radio_signal_tx.c and test_radio_signal_rx.c.
 #define RADIO_PACKET_SIZE 3
@@ -24,6 +26,7 @@ int32 CODE param_radio_channel = 128;
 static volatile XDATA uint8 packet[1 + RADIO_PACKET_SIZE + 2];
 
 static uint8 DATA currentBurstId = 0;
+static uint8 DATA messageStartByte = '!'; 
 
 void updateLeds()
 {
@@ -72,7 +75,8 @@ void rxMouseState(void)
 			if (usbComTxAvailable() >= 64) {
 
 				uint8 XDATA report[64];
-				uint8 reportLength = sprintf(report, "%3d> B1: %c, B2: %c\r\n", packet[1], packet[2], packet[3]);
+				// format: burst id, last byte represents button states
+				uint8 reportLength = sprintf(report, "%c%c%c%c", messageStartByte, packet[1], packet[2], packet[3]);
 				usbComTxSend(report, reportLength);
 			}
 			else {
