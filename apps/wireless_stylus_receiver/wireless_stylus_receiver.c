@@ -16,6 +16,7 @@ computer using its USB HID interface.
 #include <ctype.h>
 
 int32 CODE param_radio_channel = 128;
+#define USE_HID 1
 
 // This definition should be the same in both test_radio_signal_tx.c and test_radio_signal_rx.c.
 #define RADIO_PACKET_SIZE 3
@@ -31,18 +32,6 @@ void updateLeds()
 	//LED_YELLOW(radioQueueRxCurrentPacket());
 
 	LED_RED(0);
-}
-
-char nibbleToAscii(uint8 nibble)
-{
-    nibble &= 0xF;
-    if (nibble <= 0x9){ return '0' + nibble; }
-    else{ return 'A' + (nibble - 0xA); }
-}
-
-void putchar(char c)
-{
-    usbComTxSendByte(c);
 }
 
 void rxInit()
@@ -79,6 +68,7 @@ void rxMouseState(void)
         {
             currentBurstId = packet[1];
 
+#ifndef USE_HID
 			if (usbComTxAvailable() >= 64) {
 
 				uint8 XDATA report[64];
@@ -90,6 +80,12 @@ void rxMouseState(void)
 				delayMs(25);
 				LED_RED(0);
 			}
+#else
+			usbHidMouseInput.x = 0;
+			usbHidMouseInput.y =  0;
+			usbHidMouseInput.buttons = (packet[2] - '0') | ((packet[3] - '0') << 1);
+			usbHidMouseInputUpdated = 1;
+#endif
         }
         else
         {
@@ -102,36 +98,6 @@ void rxMouseState(void)
         DMAARM |= (1<<DMA_CHANNEL_RADIO);  // Arm DMA channel
         RFST = 2;                          // Switch radio to RX mode.
     }
-
-
-	/*
-	uint8 XDATA * rxBuf;
-	static uint16 pkt_count = 0;
-	
-    if (rxBuf = radioQueueRxCurrentPacket() && usbComTxAvailable())
-    {
-
-		//usbHidMouseInput.x = 0;
-        //usbHidMouseInput.y =  0;
-        //usbHidMouseInput.buttons = rxBuf[1];
-        //usbHidMouseInputUpdated = 1;
-
-
-		printf("%3d> ", pkt_count++);
-		if (pkt_count > 999) {
-			pkt_count = 0;
-		}
-
-		printf("Button 1: ");
-		putchar(nibbleToAscii(rxBuf[1] >> 1 & 0xF));
-		printf(" , Button 2: ");
-		putchar(nibbleToAscii(rxBuf[2] >> 1 & 0xF));
-		putchar('\r');
-		putchar('\n');
-
-        radioQueueRxDoneWithPacket();
-    }
-	*/
 }
 
 void main()
@@ -145,8 +111,12 @@ void main()
     {
         boardService();
 		updateLeds();
-        //usbHidService();
+        
+#ifdef USE_HID
+		usbHidService();
+#else
 		usbComService();
+#endif
 
         rxMouseState();
     }
